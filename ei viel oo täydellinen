@@ -1,0 +1,266 @@
+/* ===================================================================
+   Yks hörppy vielä! -botti v2  "Kultainen ES -viritys"
+   (toimii myös oispakaljaa.com, oispanuuskaa.com, oisparahaa – kaikki 2048-klooneja)
+
+   Tavoite: 4096-lappu (Kultainen ES) ja siitä ylöspäin.
+
+   Moottori:
+     - lauta = 4 x 16-bittinen rivi, ruudut nibbleinä (arvo = log2)
+     - siirrot, pisteet ja heuristiikka esilaskettuina 65536-taulukoihin
+     - expectimax + todennäköisyyskatkaisu + transpositiotaulu
+     - iteratiivinen syventäminen aikabudjetin sisällä (syvyys 3-9)
+     - DOM-luku vakautettu: päätös vain vakaasta, päivittyneestä laudasta
+
+   Käyttö: avaa peli -> F12 -> Console -> liitä tämä -> Enter
+     horppy.start()          // botti pelaa
+     horppy.stop()
+     horppy.step()           // yksi siirto
+     horppy.speed(15)        // ms siirtojen välillä (oletus 25)
+     horppy.strength(3)      // hakuaika/siirto: 1=8ms 2=35ms 3=120ms (oletus) 4=400ms
+     horppy.autoRetry(true)  // uusi peli kuoleman jälkeen
+     horppy.goal(4096)       // tavoitelappu, jonka jälkeen botti ilmoittaa (pelaa silti eteenpäin)
+     horppy.stats()
+   =================================================================== */
+(() => {
+  // ---------------- Esilaskennat ----------------
+  const ROWS = 65536;
+  const moveL = new Uint16Array(ROWS);   // rivi vasemmalle
+  const moveR = new Uint16Array(ROWS);   // rivi oikealle
+  const heur  = new Float64Array(ROWS);  // rivin heuristinen arvo
+  const nib   = new Uint8Array(ROWS * 4); // rivin nibblet erikseen (transponointiin)
+
+  // Heuristiikan painot (Robert Xiaon 2048-AI:n hengessä, viritetty 4096-tavoitteeseen)
+  const W_LOST = 200000, W_EMPTY = 290, W_MERGES = 720,
+        W_MONO = 52, MONO_POW = 4, W_SUM = 11, SUM_POW = 3.5;
+
+  (function buildTables() {
+    for (let r = 0; r < ROWS; r++) {
+      const line = [(r >> 12) & 15, (r >> 8) & 15, (r >> 4) & 15, r & 15];
+      nib[r * 4] = line[0]; nib[r * 4 + 1] = line[1];
+      nib[r * 4 + 2] = line[2]; nib[r * 4 + 3] = line[3];
+
+      // --- siirto vasemmalle ---
+      const t = line.filter(v => v);
+      const out = [];
+      for (let i = 0; i < t.length; i++) {
+        if (t[i] === t[i + 1] && t[i] < 15) { out.push(t[i] + 1); i++; }
+        else out.push(t[i]);
+      }
+      while (out.length < 4) out.push(0);
+      moveL[r] = (out[0] << 12) | (out[1] << 8) | (out[2] << 4) | out[3];
+
+      // --- heuristiikka ---
+      let empty = 0, merges = 0, prev = 0, counter = 0, sum = 0;
+      for (let i = 0; i < 4; i++) {
+        const rank = line[i];
+        sum += Math.pow(rank, SUM_POW);
+        if (rank === 0) empty++;
+        else {
+          if (prev === rank) counter++;
+          else if (counter > 0) { merges += 1 + counter; counter = 0; }
+          prev = rank;
+        }
+      }
+      if (counter > 0) merges += 1 + counter;
+
+      let monoL = 0, monoR = 0;
+      for (let i = 1; i < 4; i++) {
+        const a = Math.pow(line[i - 1], MONO_POW), b = Math.pow(line[i], MONO_POW);
+        if (line[i - 1] > line[i]) monoL += a - b; else monoR += b - a;
+      }
+
+      heur[r] = W_LOST + W_EMPTY * empty + W_MERGES * merges
+              - W_MONO * Math.min(monoL, monoR) - W_SUM * sum;
+    }
+
+    // Oikealle-taulu vasta kun moveL on kokonaan valmis (peilaus molemmissa päissä).
+    const rev = v => ((v & 15) << 12) | (((v >> 4) & 15) << 8) | (((v >> 8) & 15) << 4) | ((v >> 12) & 15);
+    for (let r = 0; r < ROWS; r++) moveR[r] = rev(moveL[rev(r)]);
+  })();
+
+  // ---------------- Laudan perusoperaatiot ----------------
+  const transpose = b => {
+    const o = [0, 0, 0, 0];
+    for (let y = 0; y < 4; y++) {
+      const base = b[y] * 4;
+      o[0] |= nib[base]     << (4 * (3 - y));
+      o[1] |= nib[base + 1] << (4 * (3 - y));
+      o[2] |= nib[base + 2] << (4 * (3 - y));
+      o[3] |= nib[base + 3] << (4 * (3 - y));
+    }
+    return o;
+  };
+
+  // dir: 0 ylös, 1 oikealle, 2 alas, 3 vasemmalle
+  function doMove(b, dir) {
+    if (dir === 3) return [moveL[b[0]], moveL[b[1]], moveL[b[2]], moveL[b[3]]];
+    if (dir === 1) return [moveR[b[0]], moveR[b[1]], moveR[b[2]], moveR[b[3]]];
+    const t = transpose(b);
+    const m = dir === 0
+      ? [moveL[t[0]], moveL[t[1]], moveL[t[2]], moveL[t[3]]]
+      : [moveR[t[0]], moveR[t[1]], moveR[t[2]], moveR[t[3]]];
+    return transpose(m);
+  }
+
+  const same = (a, b) => a[0] === b[0] && a[1] === b[1] && a[2] === b[2] && a[3] === b[3];
+
+  const evalBoard = b => {
+    const t = transpose(b);
+    return heur[b[0]] + heur[b[1]] + heur[b[2]] + heur[b[3]]
+         + heur[t[0]] + heur[t[1]] + heur[t[2]] + heur[t[3]];
+  };
+
+  function emptyList(b) {
+    const cells = [];
+    for (let y = 0; y < 4; y++) {
+      const base = b[y] * 4;
+      for (let x = 0; x < 4; x++) if (!nib[base + x]) cells.push([y, x]);
+    }
+    return cells;
+  }
+  const countEmpty = b => emptyList(b).length;
+  const setCell = (b, y, x, rank) => {
+    const o = b.slice();
+    o[y] = (o[y] & ~(15 << (4 * (3 - x)))) | (rank << (4 * (3 - x)));
+    return o;
+  };
+  const maxRank = b => {
+    let m = 0;
+    for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) m = Math.max(m, nib[b[y] * 4 + x]);
+    return m;
+  };
+  const anyMove = b => [0, 1, 2, 3].some(d => !same(doMove(b, d), b));
+
+  // ---------------- Expectimax ----------------
+  // Voimatasot: [aikabudjetti ms/siirto, todennäköisyyskatkaisu]
+  const LEVELS = { 1: [8, 1e-2], 2: [35, 3e-3], 3: [120, 8e-4], 4: [400, 2e-4] };
+  let level = 3, budget = LEVELS[3][0], cprobThresh = LEVELS[3][1];
+  let table = new Map(), nodes = 0, deadline = 0, aborted = false, lastDepth = 0;
+
+  const key = b => b[0] + ',' + b[1] + ',' + b[2] + ',' + b[3];
+
+  function moveNode(b, cprob, depth) {
+    let best = 0;
+    for (let d = 0; d < 4; d++) {
+      const nb = doMove(b, d);
+      if (same(nb, b)) continue;
+      const s = tileNode(nb, cprob, depth - 1);
+      if (s > best) best = s;
+    }
+    return best;
+  }
+
+  function tileNode(b, cprob, depth) {
+    nodes++;
+    if ((nodes & 2047) === 0 && Date.now() > deadline) aborted = true;
+    if (aborted || cprob < cprobThresh || depth <= 0) return evalBoard(b);
+
+    const k = key(b);
+    const hit = table.get(k);
+    if (hit !== undefined && hit.depth >= depth) return hit.score;
+
+    const cells = emptyList(b);
+    if (!cells.length) return evalBoard(b);
+    const p = cprob / cells.length;
+    let res = 0;
+    for (const [y, x] of cells) {
+      res += 0.9 * moveNode(setCell(b, y, x, 1), p * 0.9, depth);   // uusi 2
+      res += 0.1 * moveNode(setCell(b, y, x, 2), p * 0.1, depth);   // uusi 4
+    }
+    res /= cells.length;
+
+    table.set(k, { depth, score: res });
+    return res;
+  }
+
+  // Iteratiivinen syventäminen aikabudjetin sisällä: haetaan niin syvältä kuin
+  // ehditään, ja käytetään viimeistä KOKONAAN valmistunutta syvyyttä.
+  function searchDepth(b, depth) {
+    let best = null, bestScore = -Infinity;
+    for (let d = 0; d < 4; d++) {
+      const nb = doMove(b, d);
+      if (same(nb, b)) continue;
+      const s = tileNode(nb, 1, depth - 1);
+      if (aborted) return null;
+      if (s > bestScore) { bestScore = s; best = d; }
+    }
+    return best;
+  }
+
+  function bestMove(b) {
+    if (!anyMove(b)) return null;
+    nodes = 0;
+    deadline = Date.now() + budget;
+    aborted = false;
+
+    let best = null;
+    for (let depth = 3; depth <= 9; depth++) {
+      table = new Map();                      // taulu per syvyys, muisti kuriin
+      const d = searchDepth(b, depth);
+      if (d === null) break;                  // aika loppui -> pidetään edellinen
+      best = d; lastDepth = depth;
+      if (Date.now() > deadline) break;
+    }
+    return best;
+  }
+
+  // ---------------- Peliliittymä (DOM) ----------------
+  const DIRS = ['Up', 'Right', 'Down', 'Left'];
+  const CODES = [38, 39, 40, 37];
+
+  function readBoard() {
+    const b = [0, 0, 0, 0];
+    document.querySelectorAll('.tile-container .tile').forEach(el => {
+      const m = el.className.match(/tile-position-(\d+)-(\d+)/);
+      if (!m) return;
+      const x = +m[1] - 1, y = +m[2] - 1;
+      const v = parseInt(el.querySelector('.tile-inner').textContent, 10) || 0;
+      if (!v) return;
+      const rank = Math.round(Math.log2(v));
+      const cur = nib[b[y] * 4 + x];
+      // Sulautumisanimaation aikana samassa ruudussa voi olla monta lappua:
+      // tile-merged on totuus, muuten suurin arvo.
+      if (el.classList.contains('tile-merged') || rank > cur) {
+        b[y] = (b[y] & ~(15 << (4 * (3 - x)))) | (rank << (4 * (3 - x)));
+      }
+    });
+    return b;
+  }
+
+  function press(dir) {
+    const code = CODES[dir];
+    for (const type of ['keydown', 'keyup']) {
+      const ev = new KeyboardEvent(type, {
+        key: 'Arrow' + DIRS[dir], code: 'Arrow' + DIRS[dir],
+        bubbles: true, cancelable: true,
+      });
+      // keyCode/which eivät kuulu KeyboardEventInitiin -> selain nollaisi ne.
+      // Peli lukee juuri niitä, joten pakotetaan arvot paikalleen.
+      Object.defineProperty(ev, 'keyCode', { get: () => code });
+      Object.defineProperty(ev, 'which',   { get: () => code });
+      document.dispatchEvent(ev);
+    }
+  }
+
+  const q = s => document.querySelector(s);
+  const dead = () => { const m = q('.game-message'); return !!m && /game-over/.test(m.className); };
+  const score = () => {
+    const el = q('.score-container');
+    if (!el) return 0;
+    // pisteruudussa on myös "+123"-ponnahdus -> otetaan vain ensimmäinen luku
+    const txt = [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join('') || el.textContent;
+    return parseInt(txt.replace(/\D+/g, ''), 10) || 0;
+  };
+  const retry = () => q('.retry-button')?.click();
+  const keepPlaying = () => { const b = q('.keep-playing-button'); if (b && b.offsetParent) b.click(); };
+  const melatoniini = () => q('.katko-container a')?.click();
+
+  // ---------------- Silmukka ----------------
+  let timer = null, running = false, speed = 25, moves = 0,
+      autoRetry = false, goalRank = 12, goalHit = false, best = 0,
+      prevBoard = null, lastRead = null, waits = 0;
+
+  function step() {
+    keepPlaying();                       // "Jatka peliä" pois tieltä, tavoite on 4096+
+    if (dead()) {
+      console.log(`%c Peli ohi – pärinä ${score()}, suurin ${1 << maxRank(readBoard())}, ${moves} siirtoa`
